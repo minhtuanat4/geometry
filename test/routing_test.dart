@@ -396,6 +396,66 @@ void main() {
     limited.close();
   });
 
+  testWidgets(
+    'On-route progress trims geometry without rerouting; deviation retains route',
+    (tester) async {
+      final service = PendingRouting();
+      final controller = RouteController(service: service);
+      const from = LatLng(21, 105);
+      const corner = LatLng(21, 105.002);
+      const to = LatLng(21.002, 105.002);
+      final selected = RoadRoute(
+        lines: [
+          [from, corner, to],
+        ],
+        distanceMeters: 450,
+      );
+      controller.update(from: from, to: to);
+      service.requests.first.response.complete(selected);
+      await tester.pump();
+      controller.update(from: const LatLng(21.00002, 105.001), to: to);
+      expect(controller.value.driverPosition!.latitude, closeTo(21, 0.000001));
+      expect(controller.value.visibleLines.first, [
+        controller.value.driverPosition,
+        corner,
+        to,
+      ]);
+      await tester.pump(const Duration(seconds: 10));
+      expect(service.requests.length, 1);
+      controller.update(from: const LatLng(21.001, 105.001), to: to);
+      expect(service.requests.length, 2);
+      expect(controller.value.offRoute, isTrue);
+      expect(controller.value.loading, isTrue);
+      expect(identical(controller.value.route, selected), isTrue);
+      controller.update(from: const LatLng(21.0012, 105.001), to: to);
+      service.requests.last.response.completeError(
+        const RoutingException('offline'),
+      );
+      await tester.pump();
+      expect(controller.value.error, 'offline');
+      expect(identical(controller.value.route, selected), isTrue);
+      controller.retry();
+      await tester.pump(const Duration(seconds: 10));
+      expect(service.requests.length, 3);
+      expect(service.requests.last.from, const LatLng(21.0012, 105.001));
+      service.requests.last.response.complete(
+        RoadRoute(
+          lines: [
+            [const LatLng(21.0012, 105.001), to],
+          ],
+          distanceMeters: 150,
+        ),
+      );
+      await tester.pump();
+      expect(controller.value.offRoute, isFalse);
+      expect(
+        controller.value.visibleLines.first.first,
+        const LatLng(21.0012, 105.001),
+      );
+      controller.dispose();
+    },
+  );
+
   testWidgets('GPS movement is throttled and reroutes from the latest fix', (
     tester,
   ) async {

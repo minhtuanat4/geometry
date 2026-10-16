@@ -8,7 +8,7 @@ import 'routing/route_controller.dart';
 import 'routing/road_labels_layer.dart';
 import 'routing/routing_service.dart';
 import 'routing/transport_mode.dart';
-import 'tracking/demo_tracking.dart';
+import 'tracking/position_math.dart';
 import 'tracking/device_location.dart';
 import 'tracking/device_location_layer.dart';
 import 'tracking/heading_math.dart';
@@ -61,7 +61,7 @@ class _TrackingPageState extends State<TrackingPage>
   late LatLng _cameraFrom;
   late LatLng _cameraTarget;
   late double _cameraFromZoom;
-  final _tracking = DemoTracking();
+  final _driverPosition = ValueNotifier<LatLng?>(null);
   late final AddressSearchService _addressSearch;
   final _destination = ValueNotifier<AddressSuggestion?>(null);
   final _transportMode = ValueNotifier<TransportMode>(
@@ -75,8 +75,6 @@ class _TrackingPageState extends State<TrackingPage>
   final _origin = ValueNotifier<LatLng?>(null);
   bool _followDevice = true;
   final _map = MapController();
-  bool _resumeOnForeground = false;
-  final LayerHitNotifier<Object> hitNotifier = ValueNotifier(null);
 
   @override
   void initState() {
@@ -86,15 +84,12 @@ class _TrackingPageState extends State<TrackingPage>
       vsync: this,
       duration: const Duration(seconds: 2),
     )..addListener(_updateCamera);
-    hitNotifier.addListener(() {
-      // final LayerHitResult<String>? result = hitNotifier.value;
-      debugPrint("asdasdasd");
-    });
     _addressSearch = widget.addressSearchService ?? GeoapifyAddressSearch();
     _routingService = widget.routingService ?? GeoapifyRoutingService();
     _route = RouteController(service: _routingService);
     _device = widget.deviceLocation ?? DeviceLocation();
     _device.position.addListener(_onDevicePosition);
+    _route.addListener(_updateDriverPosition);
     _destination.addListener(_updateRoute);
     _transportMode.addListener(_updateRoute);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -104,18 +99,25 @@ class _TrackingPageState extends State<TrackingPage>
 
   void _onDevicePosition() {
     _updateRoute();
+    _updateDriverPosition();
     final position = _device.position.value;
     if (!mounted || position == null) return;
     if (_origin.value == null) {
-      _tracking.initialize(position);
       _origin.value = position;
-      _tracking.start();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _map.move(position, 16);
       });
     } else if (_followDevice) {
-      _map.move(position, _map.camera.zoom);
+      _map.move(_driverPosition.value ?? position, _map.camera.zoom);
     }
+  }
+
+  void _updateDriverPosition() {
+    final gps = _device.position.value;
+    _driverPosition.value = gps == null
+        ? null
+        : _route.value.driverPosition ?? gps;
+    if (gps == null) _cameraAnimation.stop();
   }
 
   void _updateRoute() {
@@ -144,8 +146,8 @@ class _TrackingPageState extends State<TrackingPage>
   }
 
   void _animateToDriver() {
-    if (!_tracking.ready) return;
-    _animateCameraTo(_tracking.position);
+    final position = _driverPosition.value;
+    if (position != null) _animateCameraTo(position);
   }
 
   void _animateCameraTo(LatLng target) {
@@ -177,16 +179,10 @@ class _TrackingPageState extends State<TrackingPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      if (_resumeOnForeground) _tracking.start();
-      _resumeOnForeground = false;
       if (_device.enabled) _device.start(requestPermission: false);
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
-      if (_tracking.running) {
-        _resumeOnForeground = true;
-        _tracking.pause();
-      }
       _cameraAnimation.stop();
       _device.suspend();
     }
@@ -197,8 +193,8 @@ class _TrackingPageState extends State<TrackingPage>
     WidgetsBinding.instance.removeObserver(this);
     _device.position.removeListener(_onDevicePosition);
     if (widget.deviceLocation == null) _device.dispose();
-    hitNotifier.dispose();
-    _tracking.dispose();
+    _route.removeListener(_updateDriverPosition);
+    _driverPosition.dispose();
     _cameraAnimation.dispose();
     _map.dispose();
     _origin.dispose();
@@ -238,57 +234,27 @@ class _TrackingPageState extends State<TrackingPage>
             maxNativeZoom: 19,
           ),
 
-        ValueListenableBuilder<AddressSuggestion?>(
-          valueListenable: _destination,
-          builder: (context, destination, _) => PolylineLayer(
-            hitNotifier: hitNotifier,
-            polylines: [
-              if (destination == null)
-                Polyline(
-                  points: _tracking.route,
-                  color: _green,
-                  strokeWidth: 5,
-                ),
-            ],
-          ),
-        ),
-
         ValueListenableBuilder<RouteState>(
           valueListenable: _route,
           builder: (context, state, _) => PolylineLayer(
             key: const ValueKey('destination-polyline'),
             polylines: [
-              for (final points in state.route?.lines ?? <List<LatLng>>[])
+              for (final points in state.visibleLines)
                 Polyline(points: points, color: _green, strokeWidth: 5),
             ],
           ),
         ),
 
+        // Raster tile labels cannot be reordered. Draw route-name overlays
+        // above the route line and below driver/destination markers.
         ValueListenableBuilder<RouteState>(
           valueListenable: _route,
           builder: (context, state, _) => RoadLabelsLayer(
-            key: const ValueKey('destination-road-labels'),
+            key: const ValueKey('route-road-labels'),
             labels: state.route?.roadLabels ?? const [],
           ),
         ),
-
-        MarkerLayer(
-          markers: [
-            Marker(
-              point: _tracking.route.first,
-              child: const _MapPin(
-                icon: Icons.restaurant,
-                color: Colors.orange,
-              ),
-            ),
-            Marker(
-              point: _tracking.route.last,
-              child: const _MapPin(icon: Icons.home_rounded, color: _green),
-            ),
-          ],
-        ),
-
-        _DriverLayer(tracking: _tracking, device: _device),
+        _DriverLayer(position: _driverPosition, device: _device),
         ValueListenableBuilder<AddressSuggestion?>(
           valueListenable: _destination,
           builder: (context, destination, _) => MarkerLayer(
@@ -314,15 +280,7 @@ class _TrackingPageState extends State<TrackingPage>
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: const Text('Theo dõi giao hàng'),
-      actions: const [
-        Padding(
-          padding: EdgeInsets.only(right: 16),
-          child: Chip(label: Text('DEMO')),
-        ),
-      ],
-    ),
+    appBar: AppBar(title: const Text('Theo dõi giao hàng')),
     body: SafeArea(
       child: Column(
         children: [
@@ -357,7 +315,7 @@ class _TrackingPageState extends State<TrackingPage>
                                 children: [
                                   Text(
                                     destination == null
-                                        ? 'Tuyến demo quanh vị trí thiết bị'
+                                        ? 'Chọn điểm đến để bắt đầu chỉ đường'
                                         : 'Điểm đến: ${destination.label}',
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
@@ -371,7 +329,12 @@ class _TrackingPageState extends State<TrackingPage>
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
                                           Text(
-                                            state.waitingForGps
+                                            state.offRoute && state.loading
+                                                ? 'Lệch tuyến • Đang tìm đường mới…'
+                                                : state.offRoute &&
+                                                      state.error == null
+                                                ? 'Lệch tuyến • Chờ cập nhật đường'
+                                                : state.waitingForGps
                                                 ? 'Đang chờ GPS để tìm đường'
                                                 : state.loading
                                                 ? 'Đang tìm tuyến đường…'
@@ -439,7 +402,7 @@ class _TrackingPageState extends State<TrackingPage>
                   right: 12,
                   bottom: 38,
                   child: ValueListenableBuilder<LatLng?>(
-                    valueListenable: _origin,
+                    valueListenable: _driverPosition,
                     child: const Icon(Icons.my_location),
                     builder: (context, origin, child) =>
                         FloatingActionButton.small(
@@ -462,80 +425,6 @@ class _TrackingPageState extends State<TrackingPage>
                         style: TextStyle(fontSize: 11),
                       ),
                     ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Bữa ngon đang trên đường',
-                  style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 4),
-                const Text('Tài xế Minh • Đơn thử nghiệm #DEMO01'),
-                const SizedBox(height: 16),
-                ListenableBuilder(
-                  listenable: _tracking,
-                  builder: (context, _) => Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        !_tracking.ready
-                            ? 'Chờ GPS để bắt đầu mô phỏng'
-                            : _tracking.completed
-                            ? 'Đã đến điểm giao mô phỏng'
-                            : '${_tracking.running ? "Đang di chuyển" : "Đã tạm dừng"} • Còn ${_tracking.remainingSeconds}s mô phỏng',
-                      ),
-                      const SizedBox(height: 10),
-                      LinearProgressIndicator(
-                        value: _tracking.progress,
-                        color: _green,
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        'Nhận ${_tracking.packets} điểm • 1 điểm/giây • Nội suy marker',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: FilledButton.icon(
-                              onPressed: !_tracking.ready || _tracking.completed
-                                  ? null
-                                  : () {
-                                      if (_tracking.running) {
-                                        _tracking.pause();
-                                      } else {
-                                        _tracking.start();
-                                      }
-                                    },
-                              icon: Icon(
-                                _tracking.running
-                                    ? Icons.pause
-                                    : Icons.play_arrow,
-                              ),
-                              label: Text(
-                                _tracking.running ? 'Tạm dừng' : 'Tiếp tục',
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          OutlinedButton.icon(
-                            onPressed: _tracking.ready
-                                ? _tracking.restart
-                                : null,
-                            icon: const Icon(Icons.replay),
-                            label: const Text('Chạy lại'),
-                          ),
-                        ],
-                      ),
-                    ],
                   ),
                 ),
               ],
@@ -566,8 +455,8 @@ class _MapPin extends StatelessWidget {
 
 /// Animation rebuilds only this layer, leaving tiles and order details alone.
 class _DriverLayer extends StatefulWidget {
-  const _DriverLayer({required this.tracking, required this.device});
-  final DemoTracking tracking;
+  const _DriverLayer({required this.position, required this.device});
+  final ValueNotifier<LatLng?> position;
   final DeviceLocation device;
 
   @override
@@ -577,59 +466,59 @@ class _DriverLayer extends StatefulWidget {
 class _DriverLayerState extends State<_DriverLayer>
     with SingleTickerProviderStateMixin {
   late final AnimationController _animation;
-  late LatLng _from;
-  late LatLng _to;
-  int _lastPacket = 0;
-  LatLng get _position => interpolatePosition(_from, _to, _animation.value);
+  LatLng? _from;
+  LatLng? _to;
+  late final Listenable _updates;
+  LatLng? get _position => _from == null || _to == null
+      ? null
+      : interpolatePosition(_from!, _to!, _animation.value);
 
   @override
   void initState() {
     super.initState();
-    _from = _to = widget.tracking.position;
+    _from = _to = widget.position.value;
     _animation = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 1),
     );
-    widget.tracking.addListener(_onPacket);
+    widget.position.addListener(_onPosition);
+    _updates = Listenable.merge([_animation, widget.position]);
   }
 
-  void _onPacket() {
-    final source = widget.tracking;
-    if (source.packets < _lastPacket) {
-      _from = _to = source.position;
-      _animation.value = 1;
-    } else if (source.packets != _lastPacket) {
-      _from = _position;
-      _to = source.position;
-      _animation.forward(from: 0);
-    } else if (!source.running) {
+  void _onPosition() {
+    final target = widget.position.value;
+    if (target == null) {
       _animation.stop();
-    } else if (_animation.value < 1) {
-      _animation.forward();
+      _from = _to = null;
+      return;
     }
-    _lastPacket = source.packets;
+    if (target == _to) return;
+    _from = _position ?? target;
+    _to = target;
+    _animation.forward(from: 0);
   }
 
   @override
   void dispose() {
-    widget.tracking.removeListener(_onPacket);
+    widget.position.removeListener(_onPosition);
     _animation.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
-    animation: _animation,
+    animation: _updates,
     builder: (context, child) => MarkerLayer(
       markers: [
-        Marker(
-          width: 76,
-          height: 76,
-          point: _position,
-          // Heading is relative to north; the map applies its rotation once.
-          rotate: false,
-          child: child!,
-        ),
+        if (_position != null)
+          Marker(
+            width: 76,
+            height: 76,
+            point: _position!,
+            // Heading is relative to north; the map applies its rotation once.
+            rotate: false,
+            child: child!,
+          ),
       ],
     ),
     // Position frames reuse this subtree. Compass events rebuild only the arrow.
